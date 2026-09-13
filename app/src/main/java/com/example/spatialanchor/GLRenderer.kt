@@ -7,8 +7,6 @@ import android.opengl.EGLContext
 import android.opengl.EGLDisplay
 import android.opengl.EGLSurface
 import android.opengl.GLES20
-import android.os.Handler
-import android.os.Looper
 import android.util.Log
 import android.view.Surface
 import java.nio.ByteBuffer
@@ -24,13 +22,13 @@ import kotlin.concurrent.thread
  * 渲染目标：全屏悬浮窗内的 TextureView 的 SurfaceTexture（EGL window surface），
  * 窗口层级覆盖所有应用，无状态栏/导航栏遮挡（详见 AnchorService 的窗口参数）。
  *
- * 画面变换（v1.3 核心数学，刚性 2D 变换）：
+ * 画面变换（核心数学）：
  *  - 采集到的屏幕画面作为纹理，贴在一个位于 z=0 的全屏四边形上；
- *  - 模型矩阵由 [matrixProvider] 提供：**绕屏幕中心的平面旋转 + 倾斜平移**，
- *    不做 3D 旋转变换 —— 手机绕屏幕法线转动时画面只做原画平面旋转（无畸变），
- *    倾斜手机时画面平移（像透过窗子看桌面），缩放比例不变、无 3D 透视变形；
- *  - 旋转/平移产生的屏幕空余区域用 glClearColor(0,0,0,1) 填充纯黑；
- *  - 片元着色器强制输出 alpha=1.0：渲染层完全不透明，杜绝底层内容透出（两层重合）。
+ *  - 模型矩阵 = 相对旋转矩阵 R_rel（由 [matrixProvider] 从姿态工具实时获取）；
+ *  - 顶点乘以模型矩阵后在三维空间旋转，等价于「画面锚定在真实空间的初始方向」——
+ *    转动手机时画面反向补偿，手机如同一个观察窗口；
+ *  - 使用正交投影（无 3D 透视变形），纹理缩放比例不变；
+ *  - 旋转产生的屏幕空余区域用 glClearColor(0,0,0,1) 填充纯黑。
  *
  * 线程模型：
  *  - 渲染线程独占 EGL 上下文，以 vsync 节奏（约 60Hz）循环绘制；
@@ -48,6 +46,14 @@ class GLRenderer(
         /** 60Hz 帧周期（纳秒），vsync 未阻塞时用于兜底节流 */
         private const val FRAME_PERIOD_NS = 16_666_667L
 
+        /** 正交投影矩阵（-1..1 视景体，列主序）：仅负向 z，无透视 */
+        private val ORTHO = floatArrayOf(
+            1f, 0f, 0f, 0f,
+            0f, 1f, 0f, 0f,
+            0f, 0f, -1f, 0f,
+            0f, 0f, 0f, 1f
+        )
+
         private val IDENTITY = floatArrayOf(
             1f, 0f, 0f, 0f,
             0f, 1f, 0f, 0f,
@@ -56,24 +62,9 @@ class GLRenderer(
         )
     }
 
-    /** 每帧渲染前读取最新刚性变换矩阵（4x4 列主序） */
+    /** 每帧渲染前读取最新相对旋转矩阵（4x4 列主序） */
     @Volatile
     var matrixProvider: (() -> FloatArray)? = null
-
-    /**
-     * 渲染线程首次成功绘制一帧后回调（已 post 到主线程）。
-     * 供 AnchorService 确认渲染层真正出画面；若超时未回调则自动回滚退出。
-     */
-    @Volatile
-    var onFirstFrameDrawn: (() -> Unit)? = null
-
-    /** EGL/GL 初始化失败回调（已 post 到主线程），外部应停止模式并提示 */
-    @Volatile
-    var onInitFailed: (() -> Unit)? = null
-
-    private val mainHandler = Handler(Looper.getMainLooper())
-
-    private var firstFrameDrawn = false
 
     /** 待上传的最新屏幕帧（采集线程写入，渲染线程 getAndSet 消费） */
     private val pendingFrame = AtomicReference<FrameData?>(null)
@@ -126,49 +117,35 @@ class GLRenderer(
     // ==================== 渲染主循环 ====================
 
     private fun runLoop() {
-        try {
-            if (!initEGL()) {
-                Log.e(TAG, "EGL 初始化失败，渲染线程退出")
-                mainHandler.post { onInitFailed?.invoke() }
-                return
-            }
-            initGL()
-            // 启用 vsync：eglSwapBuffers 会阻塞到垂直同步，渲染节奏与屏幕刷新率同步
-            EGL14.eglSwapInterval(eglDisplay, 1)
-            var lastFrameNs = System.nanoTime()
-
-            while (running) {
-                // 1. 消费最新采集帧并上传纹理
-                pendingFrame.getAndSet(null)?.let { uploadFrame(it) }
-
-                // 2. 读取最新刚性变换矩阵并绘制（无矩阵提供者时保持单位矩阵）
-                draw(matrixProvider?.invoke() ?: IDENTITY)
-
-                // 3. 首帧绘制成功确认（供外部检测渲染是否真正出画面）
-                if (!firstFrameDrawn) {
-                    firstFrameDrawn = true
-                    mainHandler.post { onFirstFrameDrawn?.invoke() }
-                }
-
-                // 4. 交换缓冲（vsync 阻塞；未阻塞时按 60Hz 兜底节流）
-                EGL14.eglSwapBuffers(eglDisplay, eglSurface)
-                val now = System.nanoTime()
-                val elapsed = now - lastFrameNs
-                lastFrameNs = now
-                if (elapsed < FRAME_PERIOD_NS) {
-                    try {
-                        Thread.sleep((FRAME_PERIOD_NS - elapsed) / 1_000_000)
-                    } catch (_: InterruptedException) {
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            // 渲染循环异常兜底：通知外部回滚，避免黑窗常驻
-            Log.e(TAG, "渲染循环异常: ${e.message}")
-            mainHandler.post { onInitFailed?.invoke() }
-        } finally {
-            destroyGL()
+        if (!initEGL()) {
+            Log.e(TAG, "EGL 初始化失败，渲染线程退出")
+            return
         }
+        initGL()
+        // 启用 vsync：eglSwapBuffers 会阻塞到垂直同步，渲染节奏与屏幕刷新率同步
+        EGL14.eglSwapInterval(eglDisplay, 1)
+        var lastFrameNs = System.nanoTime()
+
+        while (running) {
+            // 1. 消费最新采集帧并上传纹理
+            pendingFrame.getAndSet(null)?.let { uploadFrame(it) }
+
+            // 2. 读取最新相对旋转矩阵并绘制（无矩阵提供者时保持单位矩阵）
+            draw(matrixProvider?.invoke() ?: IDENTITY)
+
+            // 3. 交换缓冲（vsync 阻塞；未阻塞时按 60Hz 兜底节流）
+            EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+            val now = System.nanoTime()
+            val elapsed = now - lastFrameNs
+            lastFrameNs = now
+            if (elapsed < FRAME_PERIOD_NS) {
+                try {
+                    Thread.sleep((FRAME_PERIOD_NS - elapsed) / 1_000_000)
+                } catch (_: InterruptedException) {
+                }
+            }
+        }
+        destroyGL()
     }
 
     // ==================== EGL 初始化 ====================
@@ -242,8 +219,8 @@ class GLRenderer(
         """
 
         // 片段着色器：直接采样屏幕纹理，并【强制 alpha = 1.0】
-        // （ImageReader 的 RGBA 帧 alpha 通道为 0，若不强制为 1，渲染层整体半透明，
-        //   底层实时桌面会透过固定画显示出来，造成两个界面重合）
+        // （v1.2 回归版的唯一修复：ImageReader 的 RGBA 帧 alpha 通道为 0，
+        //   若不强制为 1，渲染层整体半透明，底层实时桌面会透出造成两层重合显示）
         val fragmentSrc = """
             precision mediump float;
             uniform sampler2D uTexture;
@@ -262,10 +239,6 @@ class GLRenderer(
         aTexCoordLoc = GLES20.glGetAttribLocation(program, "aTexCoord")
         uMvpLoc = GLES20.glGetUniformLocation(program, "uMVP")
         uTextureLoc = GLES20.glGetUniformLocation(program, "uTexture")
-
-        // 禁用混合：画面完全不透明（配合片元着色器 alpha=1.0 与 TextureView setOpaque）
-        GLES20.glDisable(GLES20.GL_BLEND)
-        GLES20.glDisable(GLES20.GL_DEPTH_TEST)
 
         // 全屏四边形（z=0）：位置(x,y,z) + 纹理坐标(u,v)
         // v 已做翻转对齐：ImageReader 首行为屏幕顶部，上传后位于纹理 v=0
@@ -310,15 +283,15 @@ class GLRenderer(
     // ==================== 每帧绘制 ====================
 
     private fun draw(model: FloatArray) {
-        // 旋转/平移产生的空余区域：纯黑填充（alpha=1，不透底）
+        // 旋转产生的空余区域：纯黑填充
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
         GLES20.glUseProgram(program)
 
-        // 模型矩阵即最终变换：绕屏幕中心的平面旋转 + 平移（无投影、无透视、无缩放）。
-        // 矩阵已由姿态工具做宽高比校正，在像素空间中是严格刚性变换，旋转不畸变。
-        GLES20.glUniformMatrix4fv(uMvpLoc, 1, false, model, 0)
+        // MVP = 正交投影 × 模型（相对旋转），列主序
+        val mvp = multiply4x4(ORTHO, model)
+        GLES20.glUniformMatrix4fv(uMvpLoc, 1, false, mvp, 0)
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, screenTexture)
@@ -421,5 +394,20 @@ class GLRenderer(
             return 0
         }
         return shader
+    }
+
+    /** 4x4 矩阵乘法（列主序）：result = a * b */
+    private fun multiply4x4(a: FloatArray, b: FloatArray): FloatArray {
+        val r = FloatArray(16)
+        for (col in 0 until 4) {
+            for (row in 0 until 4) {
+                var s = 0f
+                for (k in 0 until 4) {
+                    s += a[k * 4 + row] * b[col * 4 + k]
+                }
+                r[col * 4 + row] = s
+            }
+        }
+        return r
     }
 }
