@@ -7,6 +7,8 @@ import android.opengl.EGLContext
 import android.opengl.EGLDisplay
 import android.opengl.EGLSurface
 import android.opengl.GLES20
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.Surface
 import java.nio.ByteBuffer
@@ -54,9 +56,24 @@ class GLRenderer(
         )
     }
 
-    /** 每帧渲染前读取最新相对旋转矩阵（4x4 列主序） */
+    /** 每帧渲染前读取最新刚性变换矩阵（4x4 列主序） */
     @Volatile
     var matrixProvider: (() -> FloatArray)? = null
+
+    /**
+     * 渲染线程首次成功绘制一帧后回调（已 post 到主线程）。
+     * 供 AnchorService 确认渲染层真正出画面；若超时未回调则自动回滚退出。
+     */
+    @Volatile
+    var onFirstFrameDrawn: (() -> Unit)? = null
+
+    /** EGL/GL 初始化失败回调（已 post 到主线程），外部应停止模式并提示 */
+    @Volatile
+    var onInitFailed: (() -> Unit)? = null
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private var firstFrameDrawn = false
 
     /** 待上传的最新屏幕帧（采集线程写入，渲染线程 getAndSet 消费） */
     private val pendingFrame = AtomicReference<FrameData?>(null)
@@ -109,35 +126,49 @@ class GLRenderer(
     // ==================== 渲染主循环 ====================
 
     private fun runLoop() {
-        if (!initEGL()) {
-            Log.e(TAG, "EGL 初始化失败，渲染线程退出")
-            return
-        }
-        initGL()
-        // 启用 vsync：eglSwapBuffers 会阻塞到垂直同步，渲染节奏与屏幕刷新率同步
-        EGL14.eglSwapInterval(eglDisplay, 1)
-        var lastFrameNs = System.nanoTime()
+        try {
+            if (!initEGL()) {
+                Log.e(TAG, "EGL 初始化失败，渲染线程退出")
+                mainHandler.post { onInitFailed?.invoke() }
+                return
+            }
+            initGL()
+            // 启用 vsync：eglSwapBuffers 会阻塞到垂直同步，渲染节奏与屏幕刷新率同步
+            EGL14.eglSwapInterval(eglDisplay, 1)
+            var lastFrameNs = System.nanoTime()
 
-        while (running) {
-            // 1. 消费最新采集帧并上传纹理
-            pendingFrame.getAndSet(null)?.let { uploadFrame(it) }
+            while (running) {
+                // 1. 消费最新采集帧并上传纹理
+                pendingFrame.getAndSet(null)?.let { uploadFrame(it) }
 
-            // 2. 读取最新相对旋转矩阵并绘制（无矩阵提供者时保持单位矩阵）
-            draw(matrixProvider?.invoke() ?: IDENTITY)
+                // 2. 读取最新刚性变换矩阵并绘制（无矩阵提供者时保持单位矩阵）
+                draw(matrixProvider?.invoke() ?: IDENTITY)
 
-            // 3. 交换缓冲（vsync 阻塞；未阻塞时按 60Hz 兜底节流）
-            EGL14.eglSwapBuffers(eglDisplay, eglSurface)
-            val now = System.nanoTime()
-            val elapsed = now - lastFrameNs
-            lastFrameNs = now
-            if (elapsed < FRAME_PERIOD_NS) {
-                try {
-                    Thread.sleep((FRAME_PERIOD_NS - elapsed) / 1_000_000)
-                } catch (_: InterruptedException) {
+                // 3. 首帧绘制成功确认（供外部检测渲染是否真正出画面）
+                if (!firstFrameDrawn) {
+                    firstFrameDrawn = true
+                    mainHandler.post { onFirstFrameDrawn?.invoke() }
+                }
+
+                // 4. 交换缓冲（vsync 阻塞；未阻塞时按 60Hz 兜底节流）
+                EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+                val now = System.nanoTime()
+                val elapsed = now - lastFrameNs
+                lastFrameNs = now
+                if (elapsed < FRAME_PERIOD_NS) {
+                    try {
+                        Thread.sleep((FRAME_PERIOD_NS - elapsed) / 1_000_000)
+                    } catch (_: InterruptedException) {
+                    }
                 }
             }
+        } catch (e: Exception) {
+            // 渲染循环异常兜底：通知外部回滚，避免黑窗常驻
+            Log.e(TAG, "渲染循环异常: ${e.message}")
+            mainHandler.post { onInitFailed?.invoke() }
+        } finally {
+            destroyGL()
         }
-        destroyGL()
     }
 
     // ==================== EGL 初始化 ====================

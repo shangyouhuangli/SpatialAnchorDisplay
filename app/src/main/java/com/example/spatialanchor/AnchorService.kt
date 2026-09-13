@@ -26,6 +26,7 @@ import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 /**
  * 前台服务：应用核心 —— 悬浮窗管理、空间锚定模式的全生命周期控制。
@@ -45,6 +46,12 @@ import java.nio.ByteBuffer
  *  3. 姿态解算改为刚性 2D 变换（平面旋转 + 倾斜平移），绕屏幕中心旋转画面保持原画
  *     不畸变（详见 OrientationHelper）。
  *
+ * 【v1.4 修复与变更】
+ *  1. 首帧【深拷贝】：ScreenCapturer 内部使用 3 槽轮换复用缓冲，停止采集/后续帧
+ *     可能覆盖同一槽，导致固定画内容丢失（黑屏）；现在首帧回调时立即拷贝出独立缓冲；
+ *  2. 渲染失败自动回滚：GL 初始化失败或渲染层添加后 2 秒内未真正绘制出首帧，
+ *     自动退出模式并提示，不再出现「黑色窗口遮挡、无法操作」的卡死状态。
+ *
  * 状态机：
  *  - 未开启：桌面只有悬浮按钮（「启动」）；点击 → 记录基准姿态 + 申请录屏授权；
  *  - 已开启：悬浮按钮变「停止」；全屏渲染层叠加所有应用之上，固定画锚定真实空间；
@@ -60,6 +67,8 @@ class AnchorService : Service() {
         private const val FIRST_FRAME_TIMEOUT_MS = 3000L
         /** 授权通过后到开始截屏的间隔（毫秒）：让系统授权界面完全消失，避免被截进固定画 */
         private const val CAPTURE_DELAY_MS = 500L
+        /** 渲染确认超时（毫秒）：渲染层添加后 GL 须在此时间内真正绘制出首帧，否则自动回滚 */
+        private const val RENDER_CONFIRM_TIMEOUT_MS = 2000L
 
         const val ACTION_START_SERVICE = "com.example.spatialanchor.action.START_SERVICE"
         const val ACTION_START_CAPTURE = "com.example.spatialanchor.action.START_CAPTURE"
@@ -102,6 +111,10 @@ class AnchorService : Service() {
     private var captureTimeoutRunnable: Runnable? = null
     /** 授权通过后延迟 500ms 再开始截屏的挂起任务（停止时需一并取消） */
     private var pendingCaptureRunnable: Runnable? = null
+    /** 渲染层是否已确认真正绘制出首帧（GL onFirstFrameDrawn 回调置位） */
+    private var renderingConfirmed = false
+    /** 渲染确认超时任务 */
+    private var renderConfirmRunnable: Runnable? = null
 
     // ---- 屏幕指标（虚拟显示与渲染层尺寸） ----
     private var screenWidth = 0
@@ -353,7 +366,14 @@ class AnchorService : Service() {
         ) { buffer, w, h, stride ->
             if (!firstFrameReceived) {
                 firstFrameReceived = true
-                pendingFirstFrame = buffer
+                // 【v1.4】首帧立即深拷贝：ScreenCapturer 内部是 3 槽轮换复用缓冲，
+                // 后续帧/停止采集可能覆盖同一槽，导致固定画内容丢失（黑屏）。
+                // 拷贝出独立缓冲后，采集器无论怎么复用都不影响固定画。
+                val copy = ByteBuffer.allocateDirect(w * h * 4).order(ByteOrder.nativeOrder())
+                buffer.rewind()
+                copy.put(buffer)
+                copy.flip()
+                pendingFirstFrame = copy
                 pendingFirstFrameW = w
                 pendingFirstFrameH = h
                 captureTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
@@ -383,6 +403,18 @@ class AnchorService : Service() {
         addOverlayTextureView()
         isCapturing = true
         floatingButton?.text = "停止"
+        // 【v1.4】渲染确认超时：2 秒内 GL 未真正绘制出首帧 → 自动回滚，
+        // 避免「黑色窗口遮挡、其余功能无法操作」的卡死状态
+        renderingConfirmed = false
+        val confirm = Runnable {
+            if (!renderingConfirmed && isCapturing) {
+                Log.w(TAG, "渲染确认超时，自动回滚退出")
+                Toast.makeText(this, "画面渲染失败，已自动退出，请重试", Toast.LENGTH_LONG).show()
+                stopCapture()
+            }
+        }
+        renderConfirmRunnable = confirm
+        mainHandler.postDelayed(confirm, RENDER_CONFIRM_TIMEOUT_MS)
         Toast.makeText(this, "空间锚定模式已开启", Toast.LENGTH_SHORT).show()
         Log.i(TAG, "空间锚定模式已开启")
     }
@@ -444,6 +476,20 @@ class AnchorService : Service() {
     private fun startRenderer(surface: SurfaceTexture) {
         val renderer = GLRenderer(surface, screenWidth, screenHeight)
         renderer.matrixProvider = { orientationHelper?.latestMatrix() ?: IDENTITY }
+        // 渲染失败（EGL/GL 异常）→ 自动退出，不留黑窗
+        renderer.onInitFailed = {
+            Log.e(TAG, "渲染初始化失败回调，自动退出")
+            if (isCapturing) {
+                Toast.makeText(this, "渲染初始化失败，已自动退出", Toast.LENGTH_LONG).show()
+            }
+            stopCapture()
+        }
+        // 首帧真正绘制成功 → 取消回滚超时
+        renderer.onFirstFrameDrawn = {
+            renderingConfirmed = true
+            renderConfirmRunnable?.let { mainHandler.removeCallbacks(it) }
+            renderConfirmRunnable = null
+        }
         // 喂入固定画（渲染线程启动后自动上传纹理）
         pendingFirstFrame?.let {
             renderer.pushFrame(it, pendingFirstFrameW, pendingFirstFrameH, pendingFirstFrameW * 4)
@@ -470,6 +516,10 @@ class AnchorService : Service() {
         // 取消尚未执行的延迟截屏任务
         pendingCaptureRunnable?.let { mainHandler.removeCallbacks(it) }
         pendingCaptureRunnable = null
+        // 取消渲染确认超时任务
+        renderConfirmRunnable?.let { mainHandler.removeCallbacks(it) }
+        renderConfirmRunnable = null
+        renderingConfirmed = false
 
         // 1. 停止渲染线程并释放 GL 资源（必须先于移除窗口，避免使用已销毁的 SurfaceTexture）
         glRenderer?.stop()
@@ -510,18 +560,24 @@ class AnchorService : Service() {
     /** 获取全屏尺寸与 DPI（虚拟显示需要与物理屏幕一致） */
     private fun queryScreenMetrics() {
         val wm = getSystemService(WindowManager::class.java)
+        var w = 0
+        var h = 0
         if (Build.VERSION.SDK_INT >= 30) {
+            // 部分设备/ROM 上 Service 内 currentWindowMetrics 可能返回异常尺寸，需校验
             val bounds = wm.currentWindowMetrics.bounds
-            screenWidth = bounds.width()
-            screenHeight = bounds.height()
-        } else {
+            w = bounds.width()
+            h = bounds.height()
+        }
+        if (w <= 0 || h <= 0) {
             @Suppress("DEPRECATION")
             val metrics = DisplayMetrics()
             @Suppress("DEPRECATION")
             wm.defaultDisplay.getRealMetrics(metrics)
-            screenWidth = metrics.widthPixels
-            screenHeight = metrics.heightPixels
+            w = metrics.widthPixels
+            h = metrics.heightPixels
         }
+        screenWidth = w
+        screenHeight = h
         screenDpi = resources.displayMetrics.densityDpi
         Log.i(TAG, "屏幕尺寸: ${screenWidth}x${screenHeight}@${screenDpi}dpi")
     }
