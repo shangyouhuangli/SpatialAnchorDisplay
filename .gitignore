@@ -1,0 +1,16 @@
+# 构建产物与本地工具链不入库
+tools/
+app/build/
+.gradle/
+build/
+
+# 本机环境配置
+local.properties
+
+# 压缩包
+*.zip
+
+# IDE
+.idea/
+*.iml
+.DS_Store

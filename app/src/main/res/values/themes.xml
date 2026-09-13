@@ -1,0 +1,17 @@
+<resources>
+    <!--
+        透明主题：启动/授权 Activity 均不可见。
+
+        【v1.1 修复】改用系统最成熟的透明主题 Theme.Translucent.NoTitleBar
+        （自 API 1 起被大量悬浮窗应用使用），替代自定义 Material 透明主题，
+        规避部分机型上 windowIsTranslucent 与 Material 主题组合的兼容性崩溃；
+        同时移除 android:windowAnimationStyle=@null（部分 ROM 对该值处理异常），
+        且不设置 screenOrientation（规避 Android 8.0+ “Only fullscreen opaque
+        activities can request orientation” 崩溃）。
+    -->
+    <style name="Theme.Transparent" parent="@android:style/Theme.Translucent.NoTitleBar">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:backgroundDimEnabled">false</item>
+    </style>
+</resources>
