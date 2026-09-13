@@ -190,7 +190,16 @@ class GLRenderer(
         if (eglSurface == EGL14.EGL_NO_SURFACE) return false
 
         if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) return false
-        GLES20.glViewport(0, 0, viewWidth, viewHeight)
+        // 以 EGL 表面实际尺寸设置视口（个别机型上窗口表面尺寸可能与传入参数不同，
+        // 防止出现「小框」或边缘黑边）
+        val sw = IntArray(1)
+        val sh = IntArray(1)
+        EGL14.eglQuerySurface(eglDisplay, eglSurface, EGL14.EGL_WIDTH, sw, 0)
+        EGL14.eglQuerySurface(eglDisplay, eglSurface, EGL14.EGL_HEIGHT, sh, 0)
+        val surfaceW = if (sw[0] > 0) sw[0] else viewWidth
+        val surfaceH = if (sh[0] > 0) sh[0] else viewHeight
+        GLES20.glViewport(0, 0, surfaceW, surfaceH)
+        Log.i(TAG, "EGL 表面尺寸: ${surfaceW}x${surfaceH}")
         return true
     }
 

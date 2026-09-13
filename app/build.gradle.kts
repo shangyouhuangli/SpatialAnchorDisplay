@@ -13,8 +13,8 @@ android {
         minSdk = 29
         // 目标 SDK 34
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.2"
     }
 
     buildTypes {

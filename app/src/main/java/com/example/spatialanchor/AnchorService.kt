@@ -13,7 +13,9 @@ import android.graphics.SurfaceTexture
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.provider.Settings
 import android.util.DisplayMetrics
 import android.util.Log
@@ -23,18 +25,23 @@ import android.view.WindowManager
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import java.nio.ByteBuffer
 
 /**
  * 前台服务：应用核心 —— 悬浮窗管理、空间锚定模式的全生命周期控制。
  *
- * 状态机：
- *  - 未开启：桌面只有一个悬浮按钮（「启动」）；点击 → 申请 MediaProjection 授权；
- *  - 已开启：悬浮按钮变「停止」；全屏渲染层叠加所有应用之上，画面锚定在真实空间；
- *    点击 → 按序释放 渲染 → 悬浮层 → 录屏 → 传感器 全部资源。
+ * 【v1.2 修复与变更】
+ *  1. 真实桌面映射：点击「启动」→ 立即记录基准姿态（定位时机 = 点击瞬间）→ 录屏授权
+ *     → 抓取【一帧纯净的真实桌面】（此时全屏渲染层尚未出现）→ 停止采集 → 上渲染层。
+ *     全屏悬浮层无法被自身 MediaProjection 排除（FLAG_SECURE 会把整屏抠成黑色，
+ *     即此前黑框根因），因此「固定画」方案是唯一干净实现：桌面成为真实空间中的一幅
+ *     固定画，手机转动角度时画面反向补偿，空余区域纯黑。
+ *  2. 全屏渲染层移除 FLAG_SECURE；悬浮按钮保留 FLAG_SECURE（避免按钮残影进入固定画）。
  *
- * 权限与保活：
- *  - 常驻通知栏（前台服务），类型 mediaProjection（Android 14 创建投影的强制前提）；
- *  - 悬浮窗权限在启动 Activity 中申请，此处直接使用。
+ * 状态机：
+ *  - 未开启：桌面只有悬浮按钮（「启动」）；点击 → 记录基准姿态 + 申请录屏授权；
+ *  - 已开启：悬浮按钮变「停止」；全屏渲染层叠加所有应用之上，固定画锚定真实空间；
+ *    点击 → 按序释放 渲染 → 悬浮层 → 录屏 → 传感器 全部资源。
  */
 class AnchorService : Service() {
 
@@ -42,6 +49,8 @@ class AnchorService : Service() {
         private const val TAG = "AnchorService"
         private const val NOTIFICATION_ID = 1001
         private const val CHANNEL_ID = "anchor_service"
+        /** 首帧采集超时（毫秒）：超时说明录屏未出帧，清理并提示 */
+        private const val FIRST_FRAME_TIMEOUT_MS = 3000L
 
         const val ACTION_START_SERVICE = "com.example.spatialanchor.action.START_SERVICE"
         const val ACTION_START_CAPTURE = "com.example.spatialanchor.action.START_CAPTURE"
@@ -63,6 +72,9 @@ class AnchorService : Service() {
     private lateinit var windowManager: WindowManager
     private lateinit var projectionManager: MediaProjectionManager
 
+    /** 主线程 Handler：用于首帧回调后的 UI 操作与超时任务 */
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     // ---- 悬浮控制按钮 ----
     private var floatingButton: FloatingButtonView? = null
 
@@ -72,6 +84,13 @@ class AnchorService : Service() {
     private var glRenderer: GLRenderer? = null
     private var overlayTextureView: TextureView? = null
     private var mediaProjection: MediaProjection? = null
+
+    // ---- 启动瞬间抓取的真实桌面帧（固定画） ----
+    private var pendingFirstFrame: ByteBuffer? = null
+    private var pendingFirstFrameW = 0
+    private var pendingFirstFrameH = 0
+    private var firstFrameReceived = false
+    private var captureTimeoutRunnable: Runnable? = null
 
     // ---- 屏幕指标（虚拟显示与渲染层尺寸） ----
     private var screenWidth = 0
@@ -171,38 +190,38 @@ class AnchorService : Service() {
     private fun showFloatingButton() {
         if (floatingButton != null) return
         try {
-        val btn = FloatingButtonView(this)
-        val size = (48 * resources.displayMetrics.density).toInt()
+            val btn = FloatingButtonView(this)
+            val size = (48 * resources.displayMetrics.density).toInt()
 
-        val lp = WindowManager.LayoutParams(
-            size, size,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_SECURE, // 自身不进入录屏画面，避免鬼影
-            PixelFormat.TRANSLUCENT
-        )
-        lp.gravity = Gravity.TOP or Gravity.START
-        lp.x = 24
-        lp.y = (resources.displayMetrics.heightPixels * 0.35f).toInt()
-        btn.syncPosition(lp.x, lp.y)
+            val lp = WindowManager.LayoutParams(
+                size, size,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_SECURE, // 按钮不进入固定画画面，避免残影
+                PixelFormat.TRANSLUCENT
+            )
+            lp.gravity = Gravity.TOP or Gravity.START
+            lp.x = 24
+            lp.y = (resources.displayMetrics.heightPixels * 0.35f).toInt()
+            btn.syncPosition(lp.x, lp.y)
 
-        // 拖拽/吸附：更新窗口坐标
-        btn.onPositionUpdate = { x, y ->
-            lp.x = x
-            lp.y = y
-            try {
-                windowManager.updateViewLayout(btn, lp)
-            } catch (_: Exception) {
+            // 拖拽/吸附：更新窗口坐标
+            btn.onPositionUpdate = { x, y ->
+                lp.x = x
+                lp.y = y
+                try {
+                    windowManager.updateViewLayout(btn, lp)
+                } catch (_: Exception) {
+                }
             }
-        }
-        // 点击：模式切换（未开启→开启；已开启→停止）
-        btn.onClick = {
-            if (isCapturing) stopCapture() else handleStartCaptureClick()
-        }
+            // 点击：模式切换（未开启→开启；已开启→停止）
+            btn.onClick = {
+                if (isCapturing) stopCapture() else handleStartCaptureClick()
+            }
 
-        windowManager.addView(btn, lp)
-        floatingButton = btn
+            windowManager.addView(btn, lp)
+            floatingButton = btn
         } catch (e: Exception) {
             Log.e(TAG, "添加悬浮按钮失败: ${e.message}")
             floatingButton = null
@@ -221,7 +240,7 @@ class AnchorService : Service() {
 
     // ==================== 模式切换：开启 ====================
 
-    /** 点击「启动」：校验悬浮窗权限 → 申请录屏授权 */
+    /** 点击「启动」：记录基准姿态 → 申请录屏授权 */
     private fun handleStartCaptureClick() {
         if (isCapturing) return
         if (!Settings.canDrawOverlays(this)) {
@@ -235,7 +254,22 @@ class AnchorService : Service() {
             }
             return
         }
+        // 【v1.2】定位时机：点击「启动」的瞬间记录基准姿态（而非打开应用/授权完成时）
+        if (!startOrientationForCapture()) return
         requestProjection()
+    }
+
+    /** 点击「启动」时立即启动姿态监听，首个传感器事件即基准姿态 */
+    private fun startOrientationForCapture(): Boolean {
+        val orientation = OrientationHelper(this)
+        if (!orientation.isSupported) {
+            Toast.makeText(this, "设备不支持旋转矢量传感器", Toast.LENGTH_SHORT).show()
+            return false
+        }
+        orientationHelper = orientation
+        orientation.start()
+        Log.i(TAG, "基准姿态已记录（点击启动瞬间）")
+        return true
     }
 
     /** 启动透明授权 Activity，弹出 MediaProjection 录屏授权对话框 */
@@ -244,6 +278,9 @@ class AnchorService : Service() {
             if (resultCode == Activity.RESULT_OK && data != null) {
                 startCapture(resultCode, data)
             } else {
+                // 授权被取消：释放已启动的姿态监听，回到未开启状态
+                orientationHelper?.release()
+                orientationHelper = null
                 Toast.makeText(this, "未获得屏幕录制授权", Toast.LENGTH_SHORT).show()
             }
         }
@@ -253,14 +290,16 @@ class AnchorService : Service() {
             startActivity(intent)
         } catch (e: Exception) {
             Log.e(TAG, "启动授权页失败: ${e.message}")
+            orientationHelper?.release()
+            orientationHelper = null
             Toast.makeText(this, "无法启动录屏授权，请从桌面重新打开应用", Toast.LENGTH_LONG).show()
         }
     }
 
     /**
-     * 授权通过：正式进入空间锚定模式。
-     * 组件启动顺序（依赖关系从右到左）：
-     *  MediaProjection → 姿态工具(记录基准姿态) → 屏幕采集 → 渲染层(消费姿态+画面)
+     * 授权通过：抓取一帧真实桌面作为「固定画」，随后上全屏渲染层。
+     * 流程：MediaProjection → 虚拟显示首帧（此刻无渲染层，画面纯净）→ 停止采集
+     *       → 添加渲染层 → 渲染线程消费固定画 + 实时姿态矩阵。
      */
     private fun startCapture(resultCode: Int, data: Intent) {
         if (isCapturing) return
@@ -269,6 +308,8 @@ class AnchorService : Service() {
         val projection = projectionManager.getMediaProjection(resultCode, data)
             ?: run {
                 Toast.makeText(this, "创建录屏会话失败", Toast.LENGTH_SHORT).show()
+                orientationHelper?.release()
+                orientationHelper = null
                 return
             }
         mediaProjection = projection
@@ -280,26 +321,41 @@ class AnchorService : Service() {
             }
         }, null)
 
-        // 2. 姿态解算：启动即记录基准姿态，之后实时输出相对旋转矩阵
-        val orientation = OrientationHelper(this)
-        orientationHelper = orientation
-        if (!orientation.isSupported) {
-            Toast.makeText(this, "设备不支持旋转矢量传感器", Toast.LENGTH_SHORT).show()
-            stopCapture()
-            return
-        }
-        orientation.start()
-
-        // 3. 屏幕采集：MediaProjection → VirtualDisplay → ImageReader
+        // 2. 抓取首帧：此时全屏渲染层尚未添加，捕获到的是真实桌面（不含悬浮层）
+        firstFrameReceived = false
         screenCapturer = ScreenCapturer(
             projection, screenWidth, screenHeight, screenDpi
         ) { buffer, w, h, stride ->
-            glRenderer?.pushFrame(buffer, w, h, stride)
+            if (!firstFrameReceived) {
+                firstFrameReceived = true
+                pendingFirstFrame = buffer
+                pendingFirstFrameW = w
+                pendingFirstFrameH = h
+                captureTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+                mainHandler.post {
+                    // 首帧已就绪：停止采集，上渲染层
+                    screenCapturer?.stop()
+                    screenCapturer = null
+                    showRenderingLayer()
+                }
+            }
         }.also { it.start() }
 
-        // 4. 全屏渲染层（TextureView 悬浮窗，surface 就绪后创建 GL 渲染器）
-        addOverlayTextureView()
+        // 3. 首帧超时保护：录屏未出帧则清理退出
+        val timeout = Runnable {
+            if (!firstFrameReceived) {
+                Log.w(TAG, "首帧采集超时")
+                Toast.makeText(this, "屏幕采集超时，请重试", Toast.LENGTH_SHORT).show()
+                stopCapture()
+            }
+        }
+        captureTimeoutRunnable = timeout
+        mainHandler.postDelayed(timeout, FIRST_FRAME_TIMEOUT_MS)
+    }
 
+    /** 首帧就绪后：添加全屏渲染层并进入锚定状态 */
+    private fun showRenderingLayer() {
+        addOverlayTextureView()
         isCapturing = true
         floatingButton?.text = "停止"
         Toast.makeText(this, "空间锚定模式已开启", Toast.LENGTH_SHORT).show()
@@ -312,55 +368,59 @@ class AnchorService : Service() {
      *  - TYPE_APPLICATION_OVERLAY：覆盖所有应用之上；
      *  - FLAG_LAYOUT_IN_SCREEN / FLAG_LAYOUT_NO_LIMITS：无状态栏/导航栏遮挡；
      *  - FLAG_NOT_TOUCHABLE：触摸事件透传给下层应用；
-     *  - FLAG_SECURE：本窗口不进入录屏画面，避免「屏幕拍屏幕」反馈回路。
+     *  - 【v1.2】不再使用 FLAG_SECURE：它会令本窗口在 MediaProjection 采集中被
+     *    整块抠成黑色（此前黑框根因）；固定画在采集首帧后已定格，无反馈回路风险。
      */
     private fun addOverlayTextureView() {
         try {
-        val tv = TextureView(this)
-        tv.setOpaque(false) // 画面完全由 GL 输出（黑色背景由 glClear 填充）
+            val tv = TextureView(this)
+            tv.setOpaque(false) // 画面完全由 GL 输出（黑色背景由 glClear 填充）
 
-        val lp = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                WindowManager.LayoutParams.FLAG_SECURE,
-            PixelFormat.TRANSLUCENT
-        )
-        lp.gravity = Gravity.TOP or Gravity.START
-        lp.x = 0
-        lp.y = 0
+            val lp = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+            )
+            lp.gravity = Gravity.TOP or Gravity.START
+            lp.x = 0
+            lp.y = 0
 
-        // SurfaceTexture 就绪后启动 GL 渲染器
-        tv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-            override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-                surface.setDefaultBufferSize(screenWidth, screenHeight)
-                startRenderer(surface)
+            // SurfaceTexture 就绪后启动 GL 渲染器
+            tv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+                    surface.setDefaultBufferSize(screenWidth, screenHeight)
+                    startRenderer(surface)
+                }
+
+                override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {}
+
+                override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = true
+
+                override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
             }
 
-            override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {}
-
-            override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = true
-
-            override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
-        }
-
-        windowManager.addView(tv, lp)
-        overlayTextureView = tv
+            windowManager.addView(tv, lp)
+            overlayTextureView = tv
         } catch (e: Exception) {
             Log.e(TAG, "添加渲染悬浮窗失败: ${e.message}")
             stopCapture()
         }
     }
 
-    /** 创建 GL 渲染器：矩阵来源为姿态工具，画面来源为采集回调 */
+    /** 创建 GL 渲染器：矩阵来源为姿态工具，画面来源为启动瞬间抓取的固定画 */
     private fun startRenderer(surface: SurfaceTexture) {
         val renderer = GLRenderer(surface, screenWidth, screenHeight)
         renderer.matrixProvider = { orientationHelper?.latestMatrix() ?: IDENTITY }
+        // 喂入固定画（渲染线程启动后自动上传纹理）
+        pendingFirstFrame?.let {
+            renderer.pushFrame(it, pendingFirstFrameW, pendingFirstFrameH, pendingFirstFrameW * 4)
+        }
         renderer.start()
         glRenderer = renderer
     }
@@ -372,8 +432,12 @@ class AnchorService : Service() {
      * 渲染(EGL/线程) → 悬浮渲染层 → 屏幕采集(虚拟显示/ImageReader) → 姿态传感器 → MediaProjection
      */
     private fun stopCapture() {
-        if (!isCapturing && glRenderer == null && screenCapturer == null) return
+        if (!isCapturing && glRenderer == null && screenCapturer == null && pendingFirstFrame == null) {
+            return
+        }
         isCapturing = false
+        captureTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        captureTimeoutRunnable = null
 
         // 1. 停止渲染线程并释放 GL 资源（必须先于移除窗口，避免使用已销毁的 SurfaceTexture）
         glRenderer?.stop()
@@ -399,6 +463,10 @@ class AnchorService : Service() {
         // 5. 停止 MediaProjection（触发 onStop 回调，因 isCapturing 已复位而不会重复清理）
         mediaProjection?.stop()
         mediaProjection = null
+
+        // 6. 清空固定画缓冲
+        pendingFirstFrame = null
+        firstFrameReceived = false
 
         floatingButton?.text = "启动"
         Toast.makeText(this, "空间锚定模式已停止", Toast.LENGTH_SHORT).show()
