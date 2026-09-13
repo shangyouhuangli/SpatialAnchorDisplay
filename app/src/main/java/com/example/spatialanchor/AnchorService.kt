@@ -38,6 +38,13 @@ import java.nio.ByteBuffer
  *     固定画，手机转动角度时画面反向补偿，空余区域纯黑。
  *  2. 全屏渲染层移除 FLAG_SECURE；悬浮按钮保留 FLAG_SECURE（避免按钮残影进入固定画）。
  *
+ * 【v1.3 修复与变更】
+ *  1. 渲染层完全 opaque：片元着色器强制 alpha=1 + TextureView setOpaque(true)，
+ *     杜绝「固定画 + 底层实时桌面」两层重合显示；
+ *  2. 授权通过后延迟 500ms 再开始截屏，避免把系统提示/授权界面残影截进固定画；
+ *  3. 姿态解算改为刚性 2D 变换（平面旋转 + 倾斜平移），绕屏幕中心旋转画面保持原画
+ *     不畸变（详见 OrientationHelper）。
+ *
  * 状态机：
  *  - 未开启：桌面只有悬浮按钮（「启动」）；点击 → 记录基准姿态 + 申请录屏授权；
  *  - 已开启：悬浮按钮变「停止」；全屏渲染层叠加所有应用之上，固定画锚定真实空间；
@@ -51,6 +58,8 @@ class AnchorService : Service() {
         private const val CHANNEL_ID = "anchor_service"
         /** 首帧采集超时（毫秒）：超时说明录屏未出帧，清理并提示 */
         private const val FIRST_FRAME_TIMEOUT_MS = 3000L
+        /** 授权通过后到开始截屏的间隔（毫秒）：让系统授权界面完全消失，避免被截进固定画 */
+        private const val CAPTURE_DELAY_MS = 500L
 
         const val ACTION_START_SERVICE = "com.example.spatialanchor.action.START_SERVICE"
         const val ACTION_START_CAPTURE = "com.example.spatialanchor.action.START_CAPTURE"
@@ -91,6 +100,8 @@ class AnchorService : Service() {
     private var pendingFirstFrameH = 0
     private var firstFrameReceived = false
     private var captureTimeoutRunnable: Runnable? = null
+    /** 授权通过后延迟 500ms 再开始截屏的挂起任务（停止时需一并取消） */
+    private var pendingCaptureRunnable: Runnable? = null
 
     // ---- 屏幕指标（虚拟显示与渲染层尺寸） ----
     private var screenWidth = 0
@@ -261,7 +272,8 @@ class AnchorService : Service() {
 
     /** 点击「启动」时立即启动姿态监听，首个传感器事件即基准姿态 */
     private fun startOrientationForCapture(): Boolean {
-        val orientation = OrientationHelper(this)
+        // 传入屏幕尺寸：姿态工具需要用屏幕宽高做倾斜平移的焦距换算与宽高比校正
+        val orientation = OrientationHelper(this, screenWidth, screenHeight)
         if (!orientation.isSupported) {
             Toast.makeText(this, "设备不支持旋转矢量传感器", Toast.LENGTH_SHORT).show()
             return false
@@ -297,9 +309,10 @@ class AnchorService : Service() {
     }
 
     /**
-     * 授权通过：抓取一帧真实桌面作为「固定画」，随后上全屏渲染层。
-     * 流程：MediaProjection → 虚拟显示首帧（此刻无渲染层，画面纯净）→ 停止采集
-     *       → 添加渲染层 → 渲染线程消费固定画 + 实时姿态矩阵。
+     * 授权通过：延迟 500ms 后抓取一帧真实桌面作为「固定画」，随后上全屏渲染层。
+     * 流程：MediaProjection →（500ms 等待，让系统授权界面残影消失）→ 虚拟显示首帧
+     *       （此刻无渲染层，画面纯净）→ 停止采集 → 添加渲染层
+     *       → 渲染线程消费固定画 + 实时姿态矩阵。
      */
     private fun startCapture(resultCode: Int, data: Intent) {
         if (isCapturing) return
@@ -321,10 +334,22 @@ class AnchorService : Service() {
             }
         }, null)
 
-        // 2. 抓取首帧：此时全屏渲染层尚未添加，捕获到的是真实桌面（不含悬浮层）
+        // 2. 【v1.3】延迟 CAPTURE_DELAY_MS 再开始截屏：
+        //    授权对话框/系统提示刚消失时若立即采集，残影会被截进固定画
+        val delayedStart = Runnable {
+            pendingCaptureRunnable = null
+            if (mediaProjection == null) return@Runnable  // 等待期间已被停止
+            beginScreenCapture()
+        }
+        pendingCaptureRunnable = delayedStart
+        mainHandler.postDelayed(delayedStart, CAPTURE_DELAY_MS)
+    }
+
+    /** 实际开始截屏：此时全屏渲染层尚未添加，捕获到的是真实桌面（不含悬浮层） */
+    private fun beginScreenCapture() {
         firstFrameReceived = false
         screenCapturer = ScreenCapturer(
-            projection, screenWidth, screenHeight, screenDpi
+            mediaProjection!!, screenWidth, screenHeight, screenDpi
         ) { buffer, w, h, stride ->
             if (!firstFrameReceived) {
                 firstFrameReceived = true
@@ -341,7 +366,7 @@ class AnchorService : Service() {
             }
         }.also { it.start() }
 
-        // 3. 首帧超时保护：录屏未出帧则清理退出
+        // 首帧超时保护：录屏未出帧则清理退出
         val timeout = Runnable {
             if (!firstFrameReceived) {
                 Log.w(TAG, "首帧采集超时")
@@ -374,7 +399,9 @@ class AnchorService : Service() {
     private fun addOverlayTextureView() {
         try {
             val tv = TextureView(this)
-            tv.setOpaque(false) // 画面完全由 GL 输出（黑色背景由 glClear 填充）
+            // 【v1.3】setOpaque(true)：渲染层完全不透明，
+            // 配合片元着色器强制 alpha=1，彻底杜绝底层实时桌面透出（两层重合显示）
+            tv.setOpaque(true)
 
             val lp = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT,
@@ -432,12 +459,17 @@ class AnchorService : Service() {
      * 渲染(EGL/线程) → 悬浮渲染层 → 屏幕采集(虚拟显示/ImageReader) → 姿态传感器 → MediaProjection
      */
     private fun stopCapture() {
-        if (!isCapturing && glRenderer == null && screenCapturer == null && pendingFirstFrame == null) {
+        if (!isCapturing && glRenderer == null && screenCapturer == null &&
+            pendingFirstFrame == null && pendingCaptureRunnable == null
+        ) {
             return
         }
         isCapturing = false
         captureTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
         captureTimeoutRunnable = null
+        // 取消尚未执行的延迟截屏任务
+        pendingCaptureRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingCaptureRunnable = null
 
         // 1. 停止渲染线程并释放 GL 资源（必须先于移除窗口，避免使用已销毁的 SurfaceTexture）
         glRenderer?.stop()
